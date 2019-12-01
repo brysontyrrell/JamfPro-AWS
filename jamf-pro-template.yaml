@@ -1,0 +1,636 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+
+  AvailabilityZone1:
+    Type: String
+    Default: a
+    Description: Change the value to an alternative AZ in this region if desired
+
+  AvailabilityZone2:
+    Type: String
+    Default: b
+    Description: Change the value to an alternative AZ in this region if desired
+
+  DatabaseMode:
+    Type: String
+    Default: serverless
+    Description: Create an Aurora Cluster that is either 'serverless' or 'instance' based
+    AllowedValues:
+      - serverless
+      - cluster
+
+  DatabaseMasterUsername:
+    Type: String
+
+  DatabaseMasterPassword:
+    Type: String
+    NoEcho: true
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: (Optional) Pass an ACM certificate ARN to enable HTTPS
+
+  JamfProImageURI:
+    Type: String
+    Description: Must be the URI to a 'jamfdevops/jamfpro' based image in ECR
+
+# Groupings for AWS CloudFormation console
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Jamf Pro Service
+        Parameters:
+          - JamfProImageURI
+      - Label:
+          default: Database Configuration
+        Parameters:
+          - DatabaseMode
+          - DatabaseMasterUsername
+          - DatabaseMasterPassword
+      - Label:
+          default: Load Balancer Configuration
+        Parameters:
+          - CertificateArn
+      - Label:
+          default: VPC Configuration
+        Parameters:
+          - AvailabilityZone1
+          - AvailabilityZone2
+    ParameterLabels:
+      JamfProImageURI:
+        default: Jamf Pro Image URI (in ECR)
+      DatabaseMode:
+        default: Database Mode
+      DatabaseMasterUsername:
+        default: Database Master Username
+      DatabaseMasterPassword:
+        default: Database Master Password
+      CertificateArn:
+        default: ACM Certificate ARN
+      AvailabilityZone1:
+        default: Availability Zone 1
+      AvailabilityZone2:
+        default: Availability Zone 2
+
+Conditions:
+  Serverless: !Equals [ !Ref DatabaseMode, 'serverless' ]
+  NotServerless: !Not [ !Condition Serverless ]
+  UseHTTP: !Equals [ !Ref CertificateArn, '' ]
+
+Resources:
+
+# VPC
+
+  JamfVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Sub '10.0.0.0/24'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}'
+
+  VpcInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VpcInternetGatewayAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref VpcInternetGateway
+      VpcId: !Ref JamfVpc
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref JamfVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-route-table'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref JamfVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-route-table'
+
+  VpcInternetGatewayRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VpcInternetGateway
+    DependsOn:
+      - VpcInternetGatewayAttach
+
+# NAT Gateway Public Subnet
+
+  NatSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone1}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.0/27'
+      # 10.0.0.0 - 10.0.0.31
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-nat'
+
+  NatSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref NatSubnet
+
+# Commented out resources are for using a NAT Gateway. Far more scalable, less
+# management, but _much_ more expensive than a t3a.nano instance.
+
+#  ElasticIP:
+#    Type: AWS::EC2::EIP
+#    Properties:
+#      Domain: vpc
+
+#  NatGateway:
+#    Type: AWS::EC2::NatGateway
+#    Properties:
+#      AllocationId: !GetAtt ElasticIP.AllocationId
+#      SubnetId: !Ref NatSubnet
+#      Tags:
+#        - Key: Name
+#          Value: !Sub '${AWS::StackName}-nat-gw'
+
+#  NatGatewayRoute:
+#    Type: AWS::EC2::Route
+#    Properties:
+#      RouteTableId: !Ref PrivateRouteTable
+#      DestinationCidrBlock: 0.0.0.0/0
+#      NatGatewayId: !Ref NatGateway
+
+  NatInstanceSercurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref JamfVpc
+      GroupDescription: NAT Access
+      SecurityGroupIngress:
+        # Allowing all traffic from the Web App subnet
+        - SourceSecurityGroupId: !Ref WebAppSecurityGroup
+          IpProtocol: -1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat"
+
+  NatInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3a.nano
+      ImageId: !GetAtt NatInstaceAmi.ImageId
+      SourceDestCheck: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-ins"
+      NetworkInterfaces:
+        - SubnetId: !Ref NatSubnet
+          GroupSet:
+            - !Ref NatInstanceSercurityGroup
+          AssociatePublicIpAddress: true
+          DeviceIndex: 0
+
+  NatInstanceRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NatInstance
+
+# These custom resources will handle the lookup for the NAT instance AMI for the region
+
+  NatInstaceAmi:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt NatInstanceAmiLookup.Arn
+
+  NatInstanceAmiLookup:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      InlineCode: |
+        import json
+        from operator import itemgetter
+
+        import boto3
+        import cfnresponse
+
+        client = boto3.client('ec2')
+
+        def lambda_handler(event, context):
+          try:
+            response = client.describe_images(
+                Filters=[
+                    {'Name': 'name', 'Values': ['amzn-ami-vpc-nat-*']},
+                    {'Name': 'state', 'Values': ['available']},
+                    {'Name': 'architecture', 'Values': ['x86_64']}
+                ]
+            )
+            image_id = sorted(
+              response['Images'], key=itemgetter('CreationDate'), reverse=True
+            )[0]['ImageId']
+            cfnresponse.send(
+              event, context, cfnresponse.SUCCESS,
+              {
+                'ImageId': image_id
+              }
+            )
+
+          except Exception as error:
+            cfnresponse.send(
+              event, context, cfnresponse.FAILED,
+              {
+                'Error': type(error).__name__,
+                'Message': str(error)
+              }
+            )
+      Policies:
+        Statement:
+          Effect: Allow
+          Action: ec2:DescribeImages
+          Resource: '*'
+
+# Load Balancer Public Subnet
+
+  PublicLoadBalancerSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone1}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.32/27'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-load-balancer'
+
+  PublicLoadBalancerSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone2}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.64/27'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-load-balancer'
+
+  LoadBalancerSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicLoadBalancerSubnet1
+
+  LoadBalancerSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicLoadBalancerSubnet2
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Port 443 access to load balancers
+      SecurityGroupIngress:
+        - !If
+          - UseHTTP
+          - IpProtocol: TCP
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+          - IpProtocol: TCP
+            FromPort: 443
+            ToPort: 443
+            CidrIp: 0.0.0.0/0
+      VpcId: !Ref JamfVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-load-balancers'
+
+# Web App Private Subnet
+
+  WebAppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone1}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.192/27'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-webapp'
+
+  WebAppSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref WebAppSubnet
+
+  WebAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Default security group for web app containers
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      VpcId: !Ref JamfVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-webapps'
+
+# Database Private Subnet
+
+  DatabaseSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone1}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.128/27'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-database-1'
+
+  DatabaseSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone2}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.160/27'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-database-2'
+
+  DatabaseSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref DatabaseSubnet1
+
+  DatabaseSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref DatabaseSubnet2
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: RDS Subnet Group for Aurora databases
+      SubnetIds:
+        - !Ref DatabaseSubnet1
+        - !Ref DatabaseSubnet2
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Default security group for web app containers
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+      VpcId: !Ref JamfVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-databases'
+
+# Fargate Cluster
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+
+  FargateCloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/fargate/${AWS::StackName}"
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+
+# Aurora Serverless Database
+
+  JamfDatabaseServerless:
+    Type: AWS::RDS::DBCluster
+    Condition: Serverless
+    DeletionPolicy: Delete
+    Properties:
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      Engine: aurora
+      EngineVersion: 5.6.10a
+      EngineMode: serverless
+      StorageEncrypted: true
+      Port: 3306
+      ScalingConfiguration:
+        MinCapacity: 2
+        MaxCapacity: 2
+        AutoPause: true
+        SecondsUntilAutoPause: 1800
+      # EnableHttpEndpoint: true
+      DatabaseName: jamfsoftware
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+
+# Aurora Cluster Database
+
+  JamfDatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Condition: NotServerless
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora
+      EngineVersion: 5.6.10a
+      EngineMode: provisioned
+      StorageEncrypted: true
+      Port: 3306
+      DatabaseName: jamfsoftware
+      MasterUsername: !Ref DatabaseMasterUsername
+      MasterUserPassword: !Ref DatabaseMasterPassword
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+
+  JamfDatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: NotServerless
+    Properties:
+      Engine: aurora
+      DBClusterIdentifier: !Ref JamfDatabaseCluster
+      DBInstanceClass: db.t2.small
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+
+# The type of Aurora database is conditional on 'serverless' or 'cluster'
+# We can't make a 'DependsOn' use a condition, so the 'WaitCondition' that references a
+# different 'WaitConditionHandle' depending on which mode we have selected will insure
+# the instance for our cluster will be up before the ECS service is launched.
+
+  DefaultWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  ClusterInstanceWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Condition: NotServerless
+    DependsOn:
+      - JamfDatabaseCluster
+      - JamfDatabaseInstance
+
+  ClusterInstanceWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    Properties:
+      Handle: !If
+        - Serverless
+        - !Ref DefaultWaitHandle
+        - !Ref ClusterInstanceWaitHandle
+      Timeout: '1'
+      Count: 0
+
+# Load Balancer
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicLoadBalancerSubnet1
+        - !Ref PublicLoadBalancerSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+
+  JamfProTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref JamfVpc
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: "/healthCheck.html"
+      HealthCheckIntervalSeconds: 300
+      HealthCheckTimeoutSeconds: 30
+
+  JamfProListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: !If
+        - UseHTTP
+        - HTTP
+        - HTTPS
+      Port: !If
+        - UseHTTP
+        - 80
+        - 443
+      SslPolicy: !If
+        - UseHTTP
+        - !Ref AWS::NoValue
+        - "ELBSecurityPolicy-TLS-1-1-2017-01"
+      Certificates:
+        - !If
+          - UseHTTP
+          - !Ref AWS::NoValue
+          - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref JamfProTargetGroup
+
+# Jamf Pro Web App
+
+  JamfProTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: jamfpro
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 512
+      Memory: 2048
+      ContainerDefinitions:
+        - Name: jamfpro-webapp
+          Image: !Ref JamfProImageURI
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: DATABASE_HOST
+              Value: !If
+                - Serverless
+                - !GetAtt JamfDatabaseServerless.Endpoint.Address
+                - !GetAtt JamfDatabaseCluster.Endpoint.Address
+            - Name: DATABASE_USERNAME
+              Value: !Ref DatabaseMasterUsername
+            - Name: DATABASE_PASSWORD
+              Value: !Ref DatabaseMasterPassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/fargate/${AWS::StackName}"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: jamfpro
+
+  JamfProService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - JamfProListener
+      - ClusterInstanceWaitCondition
+    Properties:
+      LaunchType: FARGATE
+      Cluster: !Ref FargateCluster
+      TaskDefinition: !Ref JamfProTaskDefinition
+      DesiredCount: 1
+      SchedulingStrategy: REPLICA
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref WebAppSubnet
+          SecurityGroups:
+            - !Ref WebAppSecurityGroup
+          AssignPublicIp: DISABLED
+      HealthCheckGracePeriodSeconds: 300
+      LoadBalancers:
+        - TargetGroupArn: !Ref JamfProTargetGroup
+          ContainerName: jamfpro-webapp
+          ContainerPort: 8080
+
+# Helpful CloudFormation outputs
+
+Outputs:
+
+  LoadBalancerDNS:
+    Value: !GetAtt LoadBalancer.DNSName
+
+  DatabaseEndpoint:
+    Value: !If
+      - Serverless
+      - !GetAtt JamfDatabaseServerless.Endpoint.Address
+      - !GetAtt JamfDatabaseCluster.Endpoint.Address
