@@ -13,6 +13,19 @@ Parameters:
     Default: b
     Description: Change the value to an alternative AZ in this region if desired
 
+  CreateJumpBox:
+    Type: String
+    Default: false
+    Description: (Optional) Provision resources to enable a public instance access to the database subnets
+    AllowedValues:
+      - false
+      - true
+
+  JumpBoxKeyName:
+    Type: String
+    Default: ""
+    Description: Enter a valid EC2 Key Pair name (if you are creating a Jump Box)
+
   DatabaseMode:
     Type: String
     Default: serverless
@@ -61,6 +74,8 @@ Metadata:
         Parameters:
           - AvailabilityZone1
           - AvailabilityZone2
+          - CreateJumpBox
+          - JumpBoxKeyName
     ParameterLabels:
       JamfProImageURI:
         default: Jamf Pro Image URI (in ECR)
@@ -76,13 +91,67 @@ Metadata:
         default: Availability Zone 1
       AvailabilityZone2:
         default: Availability Zone 2
+      CreateJumpBox:
+        default: Create a Jump Box with required networking
+      JumpBoxKeyName:
+        default: EC2 Key Pair Name for Jump Box
 
 Conditions:
+  JumpBox: !Equals [ !Ref CreateJumpBox, 'true' ]
   Serverless: !Equals [ !Ref DatabaseMode, 'serverless' ]
   NotServerless: !Not [ !Condition Serverless ]
   UseHTTP: !Equals [ !Ref CertificateArn, '' ]
 
 Resources:
+
+# This custom resources will lookup the latest AMI for the give 'AmiSearchValue' for the region
+
+  AmiLookup:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      InlineCode: |
+        import json
+        from operator import itemgetter
+
+        import boto3
+        import cfnresponse
+
+        client = boto3.client('ec2')
+
+        def lambda_handler(event, context):
+          try:
+            response = client.describe_images(
+                Filters=[
+                    {'Name': 'name', 'Values': [event['ResourceProperties']['AmiSearchValue']]},
+                    {'Name': 'state', 'Values': ['available']},
+                    {'Name': 'architecture', 'Values': ['x86_64']}
+                ]
+            )
+            image_id = sorted(
+              response['Images'], key=itemgetter('CreationDate'), reverse=True
+            )[0]['ImageId']
+            cfnresponse.send(
+              event, context, cfnresponse.SUCCESS,
+              {
+                'ImageId': image_id
+              }
+            )
+
+          except Exception as error:
+            cfnresponse.send(
+              event, context, cfnresponse.FAILED,
+              {
+                'Error': type(error).__name__,
+                'Message': str(error)
+              }
+            )
+      Policies:
+        Statement:
+          Effect: Allow
+          Action: ec2:DescribeImages
+          Resource: '*'
 
 # VPC
 
@@ -188,6 +257,12 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-nat"
 
+  NatInstaceAmi:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AmiLookup.Arn
+      AmiSearchValue: 'amzn-ami-vpc-nat-*'
+
   NatInstance:
     Type: AWS::EC2::Instance
     Properties:
@@ -210,60 +285,6 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       InstanceId: !Ref NatInstance
-
-# These custom resources will handle the lookup for the NAT instance AMI for the region
-
-  NatInstaceAmi:
-    Type: AWS::CloudFormation::CustomResource
-    Properties:
-      ServiceToken: !GetAtt NatInstanceAmiLookup.Arn
-
-  NatInstanceAmiLookup:
-    Type: AWS::Serverless::Function
-    Properties:
-      Runtime: python3.7
-      Handler: index.lambda_handler
-      InlineCode: |
-        import json
-        from operator import itemgetter
-
-        import boto3
-        import cfnresponse
-
-        client = boto3.client('ec2')
-
-        def lambda_handler(event, context):
-          try:
-            response = client.describe_images(
-                Filters=[
-                    {'Name': 'name', 'Values': ['amzn-ami-vpc-nat-*']},
-                    {'Name': 'state', 'Values': ['available']},
-                    {'Name': 'architecture', 'Values': ['x86_64']}
-                ]
-            )
-            image_id = sorted(
-              response['Images'], key=itemgetter('CreationDate'), reverse=True
-            )[0]['ImageId']
-            cfnresponse.send(
-              event, context, cfnresponse.SUCCESS,
-              {
-                'ImageId': image_id
-              }
-            )
-
-          except Exception as error:
-            cfnresponse.send(
-              event, context, cfnresponse.FAILED,
-              {
-                'Error': type(error).__name__,
-                'Message': str(error)
-              }
-            )
-      Policies:
-        Statement:
-          Effect: Allow
-          Action: ec2:DescribeImages
-          Resource: '*'
 
 # Load Balancer Public Subnet
 
@@ -318,6 +339,38 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-load-balancers'
+
+# Jump Box Public Subnet
+# Ingress rules for the Jump Box security group must be manually created.
+# This security group by default allows no access.
+
+  JumpBoxSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: JumpBox
+    Properties:
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone1}"
+      VpcId: !Ref JamfVpc
+      CidrBlock: !Sub '10.0.0.224/27'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-jumpbox'
+
+  JumpBoxSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: JumpBox
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref JumpBoxSubnet
+
+  JumpBoxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: JumpBox
+    Properties:
+      GroupDescription: Default security group for the jump box
+      VpcId: !Ref JamfVpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-jumpbox'
 
 # Web App Private Subnet
 
@@ -402,10 +455,49 @@ Resources:
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref WebAppSecurityGroup
+        - !If
+          - JumpBox
+          - IpProtocol: TCP
+            FromPort: 3306
+            ToPort: 3306
+            SourceSecurityGroupId: !Ref JumpBoxSecurityGroup
+          - !Ref AWS::NoValue
       VpcId: !Ref JamfVpc
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-databases'
+
+# Jump Box Instance
+
+  JumpBoxInstaceAmi:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: JumpBox
+    Properties:
+      ServiceToken: !GetAtt AmiLookup.Arn
+      AmiSearchValue: 'amzn2-ami-hvm-*'
+
+  JumpBoxInstance:
+    Type: AWS::EC2::Instance
+    Condition: JumpBox
+    Properties:
+      ImageId: !GetAtt JumpBoxInstaceAmi.ImageId
+      InstanceType: t2.micro
+      AvailabilityZone: !Sub "${AWS::Region}${AvailabilityZone1}"
+      KeyName: !Ref JumpBoxKeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          SubnetId: !Ref JumpBoxSubnet
+          GroupSet:
+            - !Ref JumpBoxSecurityGroup
+      UserData: !Base64 |
+        #!/bin/sh
+        sudo yum install -y https://dev.mysql.com/get/mysql57-community-release-el7-11.noarch.rpm
+        sudo yum install -y mysql-community-client
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-jumpbox'
 
 # Fargate Cluster
 
