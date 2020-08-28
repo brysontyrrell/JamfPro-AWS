@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+#Parameters:
+
+Resources:
+
+# EventBridge Resources
+
+  JamfProEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref AWS::StackName
+
+  SampleEventBridgeProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      InlineCode: |
+        def lambda_handler(event, context):
+            print(event)
+      Events:
+        JamfProBus:
+          Type: CloudWatchEvent
+          Properties:
+            EventBusName: !Ref JamfProEventBus
+            Pattern:
+              source:
+                - jamf-pro
+
+# Aurora Resources
+
+  AuroraAllowDataEventsInvocation:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: AllowInvokeDataEvents
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AuroraDataEvents.Arn
+
+  AuroraDataEvents:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref JamfProEventBus
+      InlineCode: |
+        import json
+        import os
+
+        import boto3
+
+        client = boto3.client('events')
+
+        EVENT_BUS_NAME = os.getenv('EVENT_BUS_NAME')
+
+
+        def lambda_handler(event, context):
+            print(event)
+            client.put_events(
+                Entries=[
+                    {
+                        'Source': 'jamf-pro',
+                        'DetailType': 'change',
+                        'Detail': json.dumps(event),
+                        'EventBusName': EVENT_BUS_NAME
+                    },
+                ]
+            )
